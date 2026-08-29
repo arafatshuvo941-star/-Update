@@ -132,7 +132,7 @@ interface StoreContextType {
   syncWithGoogleSheets: (sheetId?: string) => Promise<{ success: boolean; message: string }>;
   pullFromGoogleSheets: (sheetId?: string) => Promise<{ success: boolean; message: string }>;
   connectGoogleSheets: () => Promise<{ success: boolean; message: string }>;
-  createNewGoogleSheetDatabase: () => Promise<{ success: boolean; message: string; url?: string }>;
+  createNewGoogleSheetDatabase: (forceNew?: boolean) => Promise<{ success: boolean; message: string; url?: string }>;
   disconnectGoogleSheets: () => void;
   isGoogleConnected: boolean;
 
@@ -827,9 +827,21 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
-  const createNewGoogleSheetDatabase = async (): Promise<{ success: boolean; message: string; url?: string }> => {
+  const createNewGoogleSheetDatabase = async (forceNew: boolean = false): Promise<{ success: boolean; message: string; url?: string }> => {
     try {
       setSettings((prev) => ({ ...prev, syncStatus: 'syncing' }));
+
+      // If a spreadsheet is already connected and forceNew is false, sync to existing one instead of duplicate file creation
+      if (!forceNew && settings.spreadsheetId) {
+        const syncRes = await syncWithGoogleSheets(settings.spreadsheetId);
+        if (syncRes.success) {
+          return {
+            success: true,
+            message: 'ইতোমধ্যে সংযুক্ত গুগল শিট ডাটাবেজের সাথে ডাটা সফলভাবে সিঙ্ক করা হয়েছে!',
+            url: settings.spreadsheetUrl,
+          };
+        }
+      }
       
       // If valid sheets token not present, request authorization directly
       if (!GoogleSheetsService.getToken()) {

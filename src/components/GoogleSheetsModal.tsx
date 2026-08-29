@@ -39,6 +39,7 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
 
   const [inputSheetId, setInputSheetId] = useState(settings.spreadsheetId || '');
   const [isBusy, setIsBusy] = useState(false);
+  const [showConfirmNewSheet, setShowConfirmNewSheet] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const sheetsOverview = [
@@ -51,11 +52,18 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
     { name: 'Settings', count: 6, desc: 'দোকানের নাম, ঠিকানা ও কনফিগারেশন' },
   ];
 
-  const handleCreateNewDatabase = async () => {
+  const handleCreateNewDatabase = async (force: boolean = false) => {
+    // If already connected and not confirmed, prompt user
+    if (settings.spreadsheetId && !force) {
+      setShowConfirmNewSheet(true);
+      return;
+    }
+
+    setShowConfirmNewSheet(false);
     setIsBusy(true);
     setStatusMessage(null);
     try {
-      const res = await createNewGoogleSheetDatabase();
+      const res = await createNewGoogleSheetDatabase(true);
       if (res.success) {
         setStatusMessage({ type: 'success', text: res.message });
       } else {
@@ -170,6 +178,37 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
           </div>
         )}
 
+        {/* Confirmation Modal for Creating Duplicate Sheet */}
+        {showConfirmNewSheet && (
+          <div className="p-3.5 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-xl space-y-2 animate-in fade-in">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div className="text-xs text-amber-900 dark:text-amber-200 space-y-1">
+                <p className="font-bold">সতর্কতা: আপনার অলরেডি একটি ডাটাবেজ শিট কানেক্ট করা আছে!</p>
+                <p className="text-[11px]">
+                  আপনি কি নিশ্চিত যে বর্তমান শিটটি পরিবর্তন করে আপনার গুগল ড্রাইভে <b>সম্পূর্ণ নতুন আরেকটি শিট</b> তৈরি করতে চান?
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setShowConfirmNewSheet(false)}
+                className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-bold cursor-pointer"
+              >
+                বাতিল
+              </button>
+              <button
+                type="button"
+                onClick={() => handleCreateNewDatabase(true)}
+                className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-bold cursor-pointer shadow-xs"
+              >
+                হ্যাঁ, নতুন শিট তৈরি করুন
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Connection Status Overview */}
         <div className="bg-slate-50 dark:bg-slate-900 rounded-xl p-3.5 border border-slate-200 dark:border-slate-700 space-y-2 text-xs">
           <div className="flex items-center justify-between">
@@ -177,7 +216,7 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
             <span
               className={`px-2 py-0.5 rounded-full font-bold inline-flex items-center gap-1 ${
                 settings.spreadsheetId
-                  ? 'bg-emerald-100 text-emerald-800'
+                  ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-300'
                   : 'bg-slate-200 text-slate-700 dark:text-slate-300'
               }`}
             >
@@ -196,23 +235,26 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
           </div>
 
           {settings.spreadsheetId && (
-            <div className="space-y-1 pt-1 border-t border-slate-200 dark:border-slate-700">
+            <div className="space-y-1.5 pt-1.5 border-t border-slate-200 dark:border-slate-700">
               <div className="flex justify-between items-center">
-                <span className="text-slate-500">শিট আইডি:</span>
+                <span className="text-slate-500">সংযুক্ত শিট আইডি:</span>
                 <span className="font-mono font-bold text-slate-800 dark:text-slate-200 text-[11px] truncate max-w-[200px]">
                   {settings.spreadsheetId}
                 </span>
               </div>
               {settings.spreadsheetUrl && (
-                <a
-                  href={settings.spreadsheetUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-emerald-700 hover:text-emerald-800 font-bold flex items-center gap-1 mt-1 text-[11px]"
-                >
-                  <ExternalLink className="w-3 h-3" />
-                  <span>গুগল শিটে ডাটাবেজ ফাইল খুলুন</span>
-                </a>
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500">গুগল শিট ফাইল:</span>
+                  <a
+                    href={settings.spreadsheetUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-emerald-700 dark:text-emerald-400 hover:underline font-bold flex items-center gap-1 text-[11px]"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    <span>গুগল ড্রাইভে ফাইল খুলুন</span>
+                  </a>
+                </div>
               )}
             </div>
           )}
@@ -237,72 +279,84 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
           </div>
         </div>
 
-        {/* Action Buttons */}
+        {/* Action Controls */}
         <div className="space-y-2.5 pt-2">
-          {/* 1. Create New Database in Google Drive */}
-          <button
-            id="btn-create-sheets-db"
-            disabled={isBusy}
-            onClick={handleCreateNewDatabase}
-            className="w-full py-2.5 px-3 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-xs transition-colors cursor-pointer"
-          >
-            {isBusy ? (
-              <RefreshCw className="w-4 h-4 animate-spin" />
-            ) : (
-              <Plus className="w-4 h-4" />
-            )}
-            <span>১-ক্লিকে নতুন Google Sheets ডাটাবেজ তৈরি করুন</span>
-          </button>
-
-          {/* 2. Or Connect Existing Sheet ID */}
-          <form onSubmit={handleConnectExisting} className="flex gap-2">
-            <input
-              type="text"
-              placeholder="অথবা বিদ্যমান গুগল শিটের লিংক বা ID দিন..."
-              value={inputSheetId}
-              onChange={(e) => setInputSheetId(e.target.value)}
-              className="flex-1 p-2 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-xl text-xs outline-none focus:ring-2 focus:ring-emerald-500"
-            />
-            <button
-              type="submit"
-              disabled={isBusy || !inputSheetId.trim()}
-              className="py-2 px-3 bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold transition-colors shrink-0"
-            >
-              কানেক্ট
-            </button>
-          </form>
-
-          {/* Sync & Pull Buttons if already connected */}
-          {settings.spreadsheetId && (
+          {settings.spreadsheetId ? (
+            /* IF CONNECTED: Show Sync & Pull Controls */
             <div className="space-y-2">
-              <div className="flex gap-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <button
+                  id="btn-pull-sheets-data"
                   disabled={isBusy}
                   onClick={handlePullFromSheets}
-                  className="flex-1 py-2 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 text-emerald-800 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
-                  title="গুগল শিট থেকে নতুন পণ্য ও বিক্রির ডাটা ফোনে লোড করুন"
+                  className="py-2.5 px-3 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                  title="গুগল শিট থেকে নতুন ডাটা লোড করুন"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${isBusy ? 'animate-spin' : ''}`} />
-                  <span>গুগল শিট থেকে ফোনে ডাটা লোড করুন (Pull)</span>
+                  <span>📥 শিট থেকে ডাটা আনুন (Pull)</span>
+                </button>
+
+                <button
+                  id="btn-push-sheets-data"
+                  disabled={isBusy}
+                  onClick={handleSyncNow}
+                  className="py-2.5 px-3 bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                  title="ফোন থেকে শিটে সর্বশেষ হিসাব সিঙ্ক করুন"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isBusy ? 'animate-spin' : ''}`} />
+                  <span>📤 শিটে ডাটা পাঠান (Push)</span>
                 </button>
               </div>
 
-              <div className="flex gap-2">
+              <div className="flex items-center justify-between pt-1">
                 <button
-                  disabled={isBusy}
-                  onClick={handleSyncNow}
-                  className="flex-1 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-800 dark:text-slate-200 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                  type="button"
+                  onClick={() => setShowConfirmNewSheet(true)}
+                  className="text-[11px] text-slate-500 hover:text-emerald-700 underline font-medium cursor-pointer"
                 >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isBusy ? 'animate-spin' : ''}`} />
-                  <span>ফোন থেকে শিটে ডাটা পাঠান (Push)</span>
+                  + সম্পূর্ণ নতুন আরেকটি শিট তৈরি করতে চান?
                 </button>
                 <button
                   onClick={disconnectGoogleSheets}
-                  className="py-2 px-3 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-xl text-xs font-bold cursor-pointer"
+                  className="py-1.5 px-3 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-lg text-xs font-bold cursor-pointer"
                 >
                   ডিসকানেক্ট
                 </button>
               </div>
+            </div>
+          ) : (
+            /* IF NOT CONNECTED: Show Create Database & Connect Controls */
+            <div className="space-y-2.5">
+              <button
+                id="btn-create-sheets-db"
+                disabled={isBusy}
+                onClick={() => handleCreateNewDatabase(false)}
+                className="w-full py-2.5 px-3 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-xs transition-colors cursor-pointer"
+              >
+                {isBusy ? (
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Plus className="w-4 h-4" />
+                )}
+                <span>১-ক্লিকে নতুন Google Sheets ডাটাবেজ তৈরি করুন</span>
+              </button>
+
+              <form onSubmit={handleConnectExisting} className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="অথবা বিদ্যমান গুগল শিটের লিংক বা ID দিন..."
+                  value={inputSheetId}
+                  onChange={(e) => setInputSheetId(e.target.value)}
+                  className="flex-1 p-2 bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-xl text-xs outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+                <button
+                  type="submit"
+                  disabled={isBusy || !inputSheetId.trim()}
+                  className="py-2 px-3 bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold transition-colors shrink-0 cursor-pointer"
+                >
+                  কানেক্ট
+                </button>
+              </form>
             </div>
           )}
         </div>
