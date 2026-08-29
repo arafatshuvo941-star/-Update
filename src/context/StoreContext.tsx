@@ -130,6 +130,7 @@ interface StoreContextType {
   // Settings & Google Sheets Sync
   updateSettings: (newSettings: Partial<StoreSettings>) => void;
   syncWithGoogleSheets: (sheetId?: string) => Promise<{ success: boolean; message: string }>;
+  pullFromGoogleSheets: (sheetId?: string) => Promise<{ success: boolean; message: string }>;
   connectGoogleSheets: () => Promise<{ success: boolean; message: string }>;
   createNewGoogleSheetDatabase: () => Promise<{ success: boolean; message: string; url?: string }>;
   disconnectGoogleSheets: () => void;
@@ -896,6 +897,74 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
+  const pullFromGoogleSheets = async (sheetId?: string): Promise<{ success: boolean; message: string }> => {
+    const targetSheetId = sheetId || settings.spreadsheetId;
+    if (!targetSheetId) {
+      return { success: false, message: 'Google Sheet ID পাওয়া যায়নি' };
+    }
+
+    try {
+      setSettings((prev) => ({ ...prev, syncStatus: 'syncing' }));
+
+      // Check auth token
+      if (!GoogleSheetsService.getToken()) {
+        try {
+          await GoogleSheetsService.requestAuth();
+        } catch (gisErr) {
+          await googleSignIn(true);
+        }
+      }
+
+      const res = await GoogleSheetsService.fetchDataFromGoogleSheets(targetSheetId);
+      if (res.success && res.data) {
+        if (res.data.products && res.data.products.length > 0) {
+          setProducts(res.data.products);
+        }
+        if (res.data.sales && res.data.sales.length > 0) {
+          setSales(res.data.sales);
+        }
+        if (res.data.customers && res.data.customers.length > 0) {
+          setCustomers(res.data.customers);
+        }
+        if (res.data.payments && res.data.payments.length > 0) {
+          setPayments(res.data.payments);
+        }
+        if (res.data.expenses && res.data.expenses.length > 0) {
+          setExpenses(res.data.expenses);
+        }
+        if (res.data.settings) {
+          setSettings((prev) => ({
+            ...prev,
+            ...res.data!.settings,
+            spreadsheetId: targetSheetId,
+            spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
+            syncStatus: 'synced',
+            lastSyncTime: new Date().toISOString(),
+            syncError: undefined,
+          }));
+        } else {
+          setSettings((prev) => ({
+            ...prev,
+            spreadsheetId: targetSheetId,
+            spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
+            syncStatus: 'synced',
+            lastSyncTime: new Date().toISOString(),
+            syncError: undefined,
+          }));
+        }
+
+        setIsGoogleConnected(true);
+        return { success: true, message: 'গুগল শিট থেকে সমস্ত ডাটা সফলভাবে ফোনে লোড ও সিঙ্ক করা হয়েছে!' };
+      } else {
+        setSettings((prev) => ({ ...prev, syncStatus: 'error', syncError: res.message }));
+        return { success: false, message: res.message };
+      }
+    } catch (err: any) {
+      setSettings((prev) => ({ ...prev, syncStatus: 'error', syncError: err?.message }));
+      return { success: false, message: err?.message || 'ডাটা লোড করতে সমস্যা হয়েছে' };
+    }
+  };
+
   const syncWithGoogleSheets = async (sheetId?: string): Promise<{ success: boolean; message: string }> => {
     const targetSheetId = sheetId || settings.spreadsheetId;
     if (!targetSheetId) {
@@ -904,6 +973,38 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     try {
       setSettings((prev) => ({ ...prev, syncStatus: 'syncing' }));
+
+      // If connecting a new sheet from another device (or sheetId provided explicitly),
+      // let's try pulling existing data first
+      if (sheetId && sheetId !== settings.spreadsheetId) {
+        if (!GoogleSheetsService.getToken()) {
+          try {
+            await GoogleSheetsService.requestAuth();
+          } catch (gisErr) {
+            await googleSignIn(true);
+          }
+        }
+
+        const pullRes = await GoogleSheetsService.fetchDataFromGoogleSheets(targetSheetId);
+        if (pullRes.success && pullRes.data && pullRes.data.products && pullRes.data.products.length > 0) {
+          setProducts(pullRes.data.products);
+          if (pullRes.data.sales) setSales(pullRes.data.sales);
+          if (pullRes.data.customers) setCustomers(pullRes.data.customers);
+          if (pullRes.data.payments) setPayments(pullRes.data.payments);
+          if (pullRes.data.expenses) setExpenses(pullRes.data.expenses);
+          setSettings((prev) => ({
+            ...prev,
+            spreadsheetId: targetSheetId,
+            spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
+            syncStatus: 'synced',
+            lastSyncTime: new Date().toISOString(),
+            syncError: undefined,
+          }));
+          setIsGoogleConnected(true);
+          return { success: true, message: 'বিদ্যমান গুগল শিট ডাটাবেজের সাথে সফলভাবে কানেক্ট ও ডাটা লোড হয়েছে!' };
+        }
+      }
+
       const res = await GoogleSheetsService.syncAllData(targetSheetId, {
         products,
         sales,
@@ -1102,6 +1203,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         deleteExpense,
         updateSettings,
         syncWithGoogleSheets,
+        pullFromGoogleSheets,
         connectGoogleSheets,
         createNewGoogleSheetDatabase,
         disconnectGoogleSheets,

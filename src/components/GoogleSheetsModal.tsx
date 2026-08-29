@@ -30,6 +30,7 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
     payments,
     expenses,
     syncWithGoogleSheets,
+    pullFromGoogleSheets,
     connectGoogleSheets,
     createNewGoogleSheetDatabase,
     disconnectGoogleSheets,
@@ -106,6 +107,23 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
       }
     } catch (err: any) {
       setStatusMessage({ type: 'error', text: err?.message || 'Sync failed' });
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handlePullFromSheets = async () => {
+    setIsBusy(true);
+    setStatusMessage(null);
+    try {
+      const res = await pullFromGoogleSheets();
+      if (res.success) {
+        setStatusMessage({ type: 'success', text: res.message });
+      } else {
+        setStatusMessage({ type: 'error', text: res.message });
+      }
+    } catch (err: any) {
+      setStatusMessage({ type: 'error', text: err?.message || 'Failed to pull data' });
     } finally {
       setIsBusy(false);
     }
@@ -254,25 +272,47 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
             </button>
           </form>
 
-          {/* Sync Now Button if already connected */}
+          {/* Sync & Pull Buttons if already connected */}
           {settings.spreadsheetId && (
-            <div className="flex gap-2">
-              <button
-                disabled={isBusy}
-                onClick={handleSyncNow}
-                className="flex-1 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-800 dark:text-slate-200 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isBusy ? 'animate-spin' : ''}`} />
-                <span>এখনই সম্পূর্ণ ডাটা সিঙ্ক করুন</span>
-              </button>
-              <button
-                onClick={disconnectGoogleSheets}
-                className="py-2 px-3 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-xl text-xs font-bold"
-              >
-                ডিসকানেক্ট
-              </button>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <button
+                  disabled={isBusy}
+                  onClick={handlePullFromSheets}
+                  className="flex-1 py-2 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 text-emerald-800 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                  title="গুগল শিট থেকে নতুন পণ্য ও বিক্রির ডাটা ফোনে লোড করুন"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isBusy ? 'animate-spin' : ''}`} />
+                  <span>গুগল শিট থেকে ফোনে ডাটা লোড করুন (Pull)</span>
+                </button>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  disabled={isBusy}
+                  onClick={handleSyncNow}
+                  className="flex-1 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-800 dark:text-slate-200 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isBusy ? 'animate-spin' : ''}`} />
+                  <span>ফোন থেকে শিটে ডাটা পাঠান (Push)</span>
+                </button>
+                <button
+                  onClick={disconnectGoogleSheets}
+                  className="py-2 px-3 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-xl text-xs font-bold cursor-pointer"
+                >
+                  ডিসকানেক্ট
+                </button>
+              </div>
             </div>
           )}
+        </div>
+
+        {/* Mobile Connection Helper Note */}
+        <div className="p-2.5 bg-blue-50/80 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl text-[11px] text-blue-800 dark:text-blue-200 space-y-1">
+          <p className="font-bold">📱 মোবাইল ফোনে ডাটাবেজ কানেক্ট করার নিয়ম:</p>
+          <p className="text-blue-700 dark:text-blue-300">
+            কম্পিউটারে তৈরি করা আপনার গুগল শিটের লিংকটি কপি করে মোবাইলে উপরের <b>"বিদ্যমান গুগল শিটের লিংক বা ID দিন"</b> বক্সে পেস্ট করে <b>"কানেক্ট"</b> চাপুন। সাথে সাথে আপনার দোকানের সমস্ত পণ্য ও হিসাব মোবাইলে চলে আসবে!
+          </p>
         </div>
 
         {/* Footer */}

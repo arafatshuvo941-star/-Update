@@ -498,4 +498,185 @@ export class GoogleSheetsService {
       return false;
     }
   }
+
+  /**
+   * Fetch all data from an existing Google Sheet (to restore/pull on another device like mobile)
+   */
+  public static async fetchDataFromGoogleSheets(spreadsheetId: string): Promise<{
+    success: boolean;
+    data?: {
+      products: Product[];
+      sales: Sale[];
+      customers: Customer[];
+      payments: Payment[];
+      expenses: Expense[];
+      settings: Partial<StoreSettings>;
+    };
+    message: string;
+  }> {
+    const token = this.getToken();
+    if (!token) {
+      return { success: false, message: 'Google authentication required.' };
+    }
+
+    try {
+      const ranges = [
+        'Products!A2:L',
+        'Sales!A2:L',
+        'SaleItems!A2:K',
+        'Customers!A2:G',
+        'Payments!A2:J',
+        'Expenses!A2:G',
+        'Settings!A2:B',
+      ];
+      const rangesParam = ranges.map((r) => `ranges=${encodeURIComponent(r)}`).join('&');
+      const response = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchGet?${rangesParam}`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        return {
+          success: false,
+          message: err.error?.message || `Failed to fetch data from spreadsheet (${response.status})`,
+        };
+      }
+
+      const resJson = await response.json();
+      const valueRanges = resJson.valueRanges || [];
+
+      // Parse Products
+      const productRows = valueRanges[0]?.values || [];
+      const products: Product[] = productRows.map((r: any[], idx: number) => ({
+        id: r[0] || `prod-${idx + 1}`,
+        name: r[1] || 'Product',
+        category: r[2] || 'General',
+        unit: r[3] || 'Pcs',
+        purchasePrice: Number(r[4]) || 0,
+        salePrice: Number(r[5]) || 0,
+        currentStock: Number(r[6]) || 0,
+        minStock: Number(r[7]) || 5,
+        barcode: r[8] || undefined,
+        expiryDate: r[9] || undefined,
+        createdAt: new Date().toISOString(),
+        updatedAt: r[11] || new Date().toISOString(),
+      }));
+
+      // Parse Sale Items
+      const saleItemRows = valueRanges[2]?.values || [];
+      const saleItemsByInvoice: Record<string, SaleItem[]> = {};
+      saleItemRows.forEach((r: any[], idx: number) => {
+        const invoiceNum = r[1];
+        if (!invoiceNum) return;
+        const item: SaleItem = {
+          id: r[0] || `item-${idx + 1}`,
+          saleId: invoiceNum,
+          productId: r[2] || '',
+          productName: r[3] || '',
+          unit: r[4] || 'Pcs',
+          quantity: Number(r[5]) || 1,
+          purchasePrice: Number(r[6]) || 0,
+          salePrice: Number(r[7]) || 0,
+          totalPrice: Number(r[8]) || 0,
+          profit: Number(r[9]) || 0,
+          createdAt: r[10] || new Date().toISOString(),
+        };
+        if (!saleItemsByInvoice[invoiceNum]) {
+          saleItemsByInvoice[invoiceNum] = [];
+        }
+        saleItemsByInvoice[invoiceNum].push(item);
+      });
+
+      // Parse Sales
+      const saleRows = valueRanges[1]?.values || [];
+      const sales: Sale[] = saleRows.map((r: any[], idx: number) => {
+        const invoiceNumber = r[0] || `INV-${1000 + idx}`;
+        return {
+          id: `sale-${idx + 1}`,
+          invoiceNumber,
+          customerName: r[1] || 'Walk-in Customer',
+          customerPhone: r[2] || undefined,
+          subtotal: Number(r[3]) || 0,
+          discount: Number(r[4]) || 0,
+          totalAmount: Number(r[5]) || 0,
+          paidAmount: Number(r[6]) || 0,
+          dueAmount: Number(r[7]) || 0,
+          paymentMethod: (r[8] as any) || 'Cash',
+          paymentDetails: r[9] || undefined,
+          totalProfit: Number(r[10]) || 0,
+          createdAt: r[11] || new Date().toISOString(),
+          items: saleItemsByInvoice[invoiceNumber] || [],
+        };
+      });
+
+      // Parse Customers
+      const customerRows = valueRanges[3]?.values || [];
+      const customers: Customer[] = customerRows.map((r: any[], idx: number) => ({
+        id: r[0] || `cust-${idx + 1}`,
+        name: r[1] || '',
+        phone: r[2] || '',
+        address: r[3] || '',
+        totalDue: Number(r[4]) || 0,
+        totalPurchases: Number(r[5]) || 0,
+        lastTransactionDate: r[6] || undefined,
+        createdAt: new Date().toISOString(),
+      }));
+
+      // Parse Payments
+      const paymentRows = valueRanges[4]?.values || [];
+      const payments: Payment[] = paymentRows.map((r: any[], idx: number) => ({
+        id: r[0] || `pay-${idx + 1}`,
+        customerId: r[1] || '',
+        customerName: r[2] || '',
+        amount: Number(r[3]) || 0,
+        paymentMethod: (r[4] as any) || 'Cash',
+        trxId: r[5] || undefined,
+        previousDue: Number(r[6]) || 0,
+        remainingDue: Number(r[7]) || 0,
+        note: r[8] || undefined,
+        createdAt: r[9] || new Date().toISOString(),
+      }));
+
+      // Parse Expenses
+      const expenseRows = valueRanges[5]?.values || [];
+      const expenses: Expense[] = expenseRows.map((r: any[], idx: number) => ({
+        id: r[0] || `exp-${idx + 1}`,
+        title: r[1] || 'Expense',
+        category: (r[2] as any) || 'Others',
+        amount: Number(r[3]) || 0,
+        paymentMethod: (r[4] as any) || 'Cash',
+        note: r[5] || undefined,
+        createdAt: r[6] || new Date().toISOString(),
+      }));
+
+      // Parse Settings
+      const settingsRows = valueRanges[6]?.values || [];
+      const fetchedSettings: Partial<StoreSettings> = {};
+      settingsRows.forEach((r: any[]) => {
+        const key = r[0];
+        const val = r[1];
+        if (key && val) {
+          (fetchedSettings as any)[key] = val;
+        }
+      });
+
+      return {
+        success: true,
+        data: {
+          products,
+          sales,
+          customers,
+          payments,
+          expenses,
+          settings: fetchedSettings,
+        },
+        message: 'Data successfully pulled from Google Sheets.',
+      };
+    } catch (err: any) {
+      return { success: false, message: err?.message || 'Error pulling data from Google Sheets' };
+    }
+  }
 }
