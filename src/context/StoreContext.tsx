@@ -24,6 +24,14 @@ import { generateId, isToday, isThisMonth } from '../utils/formatters';
 import { translations, Language } from '../utils/i18n';
 import { GoogleSheetsService } from '../services/googleSheetsService';
 import { googleSignIn, logout as firebaseLogout } from '../services/firebaseAuth';
+import {
+  mergeProducts,
+  mergeSales,
+  mergeCustomers,
+  mergePayments,
+  mergeExpenses,
+} from '../utils/dataMerge';
+import { recordDeletedId, clearAllDeletedIds } from '../utils/tombstones';
 
 interface StoredUserAccount extends User {
   password?: string;
@@ -115,6 +123,7 @@ interface StoreContextType {
   // Customer Actions
   addCustomer: (customer: Omit<Customer, 'id' | 'createdAt' | 'totalDue' | 'totalPurchases'>) => Customer;
   updateCustomer: (id: string, updates: Partial<Customer>) => void;
+  deleteCustomer: (id: string) => void;
   receiveCustomerPayment: (params: {
     customerId: string;
     amount: number;
@@ -122,6 +131,7 @@ interface StoreContextType {
     trxId?: string;
     note?: string;
   }) => Promise<{ success: boolean; payment?: Payment; error?: string }>;
+  deletePayment: (id: string) => void;
 
   // Expense Actions
   addExpense: (expense: Omit<Expense, 'id' | 'createdAt'>) => void;
@@ -210,7 +220,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [activeTab, setActiveTab] = useState<'dashboard' | 'sales' | 'products' | 'customers' | 'expenses' | 'reports'>('dashboard');
   const [cart, setCart] = useState<CartItem[]>([]);
   const [lastSale, setLastSale] = useState<Sale | null>(null);
-  const [isGoogleConnected, setIsGoogleConnected] = useState<boolean>(() => GoogleSheetsService.isConnected());
+  const [isGoogleConnected, setIsGoogleConnected] = useState<boolean>(() => Boolean(settings.spreadsheetId));
+
+  // Keep isGoogleConnected in sync with spreadsheetId
+  useEffect(() => {
+    setIsGoogleConnected(Boolean(settings.spreadsheetId));
+  }, [settings.spreadsheetId]);
 
   // Persistence side-effects
   useEffect(() => {
@@ -249,6 +264,47 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
   }, [settings]);
 
+  // --- Persistent Background Google Connection Health-Check & Auto-Renewal ---
+  useEffect(() => {
+    if (!settings.spreadsheetId) return;
+
+    const performSilentRenewal = async () => {
+      try {
+        const token = await GoogleSheetsService.getValidTokenOrRefresh(false);
+        if (token) {
+          setIsGoogleConnected(true);
+          if (settings.syncStatus === 'needs_auth') {
+            setSettings((prev) => ({ ...prev, syncStatus: 'synced', syncError: undefined }));
+          }
+        }
+      } catch (err) {
+        console.debug('Background silent renewal check:', err);
+      }
+    };
+
+    // Run on startup
+    performSilentRenewal();
+
+    // Run every 5 minutes so token stays active forever in the background
+    const interval = setInterval(performSilentRenewal, 5 * 60 * 1000);
+
+    // Also run whenever user switches tabs or focuses the window
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        performSilentRenewal();
+      }
+    };
+
+    window.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleVisibilityChange);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleVisibilityChange);
+    };
+  }, [settings.spreadsheetId, settings.syncStatus]);
+
   // --- Google Sheets Auto-Sync (Debounced) ---
   const syncDataRef = useRef({ products, sales, customers, payments, expenses, settings });
   
@@ -258,14 +314,26 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   }, [products, sales, customers, payments, expenses, settings]);
 
   useEffect(() => {
-    // Only run if we are connected and have a spreadsheet ID
-    if (!isGoogleConnected || !settings.spreadsheetId) return;
+    // Only run if we have a spreadsheet ID configured
+    if (!settings.spreadsheetId) return;
 
     const timer = setTimeout(async () => {
+      // Check if we have a valid token or silently refresh
+      const token = await GoogleSheetsService.getValidTokenOrRefresh(false);
+
+      if (!token) {
+        setSettings((prev) => ({
+          ...prev,
+          syncStatus: 'needs_auth',
+          syncError: 'গুগল টোকেন রিনিউ করতে ১-ক্লিক করুন',
+        }));
+        return;
+      }
+
       try {
         setSettings((prev) => ({ ...prev, syncStatus: 'syncing' }));
         
-        // Grab the latest data from ref to prevent stale closures and infinite dependency loops
+        // Grab latest data from ref to prevent stale closures
         const data = syncDataRef.current;
         const result = await GoogleSheetsService.syncAllData(settings.spreadsheetId, data);
         
@@ -275,6 +343,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             syncStatus: 'synced',
             lastSyncTime: new Date().toISOString(),
             syncError: undefined,
+          }));
+        } else if (result.isAuthRequired) {
+          setSettings((prev) => ({
+            ...prev,
+            syncStatus: 'needs_auth',
+            syncError: 'গুগল সেশন শেষ হয়েছে। রিনিউ করতে ক্লিক করুন।',
           }));
         } else {
           setSettings((prev) => ({
@@ -290,10 +364,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           syncError: err?.message || 'Sync failed',
         }));
       }
-    }, 3000); // 3-second debounce
+    }, 2000); // 2-second debounce
 
     return () => clearTimeout(timer);
-  }, [products, sales, customers, payments, expenses, isGoogleConnected]); // Deliberately omitting `settings` to prevent infinite loops caused by updating syncStatus
+  }, [products, sales, customers, payments, expenses, settings.spreadsheetId]);
 
   // Language translation helper
   const language = settings.language || 'bn';
@@ -633,6 +707,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       const saleToDelete = prev.find((s) => s.id === saleId);
       if (!saleToDelete) return prev;
 
+      // Record tombstone to prevent deleted item from ever reappearing on Google Sheets pull
+      recordDeletedId([saleToDelete.id, saleToDelete.invoiceNumber || '']);
+
       // 1. Restore product stock
       setProducts((currentProducts) => {
         const updatedProducts = [...currentProducts];
@@ -689,7 +766,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   }, []);
 
   const deleteProduct = useCallback((id: string) => {
-    setProducts((prev) => prev.filter((p) => p.id !== id));
+    setProducts((prev) => {
+      const prod = prev.find((p) => p.id === id);
+      if (prod) {
+        recordDeletedId([prod.id, prod.barcode || '']);
+      }
+      return prev.filter((p) => p.id !== id);
+    });
   }, []);
 
   const restockProduct = useCallback((id: string, addedQty: number, newPurchasePrice?: number) => {
@@ -726,6 +809,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const updateCustomer = useCallback((id: string, updates: Partial<Customer>) => {
     setCustomers((prev) => prev.map((c) => (c.id === id ? { ...c, ...updates } : c)));
+  }, []);
+
+  const deleteCustomer = useCallback((id: string) => {
+    setCustomers((prev) => {
+      const cust = prev.find((c) => c.id === id);
+      if (cust) {
+        recordDeletedId([cust.id, cust.phone || '']);
+      }
+      return prev.filter((c) => c.id !== id);
+    });
   }, []);
 
   const receiveCustomerPayment = async ({
@@ -786,6 +879,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return { success: true, payment: newPayment };
   };
 
+  const deletePayment = useCallback((id: string) => {
+    setPayments((prev) => {
+      const pay = prev.find((p) => p.id === id);
+      if (pay) {
+        recordDeletedId([pay.id, pay.trxId || '']);
+      }
+      return prev.filter((p) => p.id !== id);
+    });
+  }, []);
+
   // 7. Expense Management
   const addExpense = useCallback((expenseData: Omit<Expense, 'id' | 'createdAt'>) => {
     const newExp: Expense = {
@@ -797,6 +900,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   }, []);
 
   const deleteExpense = useCallback((id: string) => {
+    recordDeletedId(id);
     setExpenses((prev) => prev.filter((e) => e.id !== id));
   }, []);
 
@@ -918,55 +1022,54 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     try {
       setSettings((prev) => ({ ...prev, syncStatus: 'syncing' }));
 
-      // Check auth token
-      if (!GoogleSheetsService.getToken()) {
+      // Check auth token or perform background silent refresh
+      let token = await GoogleSheetsService.getValidTokenOrRefresh(false);
+      if (!token) {
         try {
-          await GoogleSheetsService.requestAuth();
-        } catch (gisErr) {
+          token = await GoogleSheetsService.requestAuth(undefined, true);
+        } catch {
           await googleSignIn(true);
         }
       }
 
       const res = await GoogleSheetsService.fetchDataFromGoogleSheets(targetSheetId);
       if (res.success && res.data) {
-        if (res.data.products && res.data.products.length > 0) {
-          setProducts(res.data.products);
-        }
-        if (res.data.sales && res.data.sales.length > 0) {
-          setSales(res.data.sales);
-        }
-        if (res.data.customers && res.data.customers.length > 0) {
-          setCustomers(res.data.customers);
-        }
-        if (res.data.payments && res.data.payments.length > 0) {
-          setPayments(res.data.payments);
-        }
-        if (res.data.expenses && res.data.expenses.length > 0) {
-          setExpenses(res.data.expenses);
-        }
-        if (res.data.settings) {
-          setSettings((prev) => ({
-            ...prev,
-            ...res.data!.settings,
-            spreadsheetId: targetSheetId,
-            spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
-            syncStatus: 'synced',
-            lastSyncTime: new Date().toISOString(),
-            syncError: undefined,
-          }));
-        } else {
-          setSettings((prev) => ({
-            ...prev,
-            spreadsheetId: targetSheetId,
-            spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
-            syncStatus: 'synced',
-            lastSyncTime: new Date().toISOString(),
-            syncError: undefined,
-          }));
-        }
+        // Smart bi-directional merge: prevents duplicates AND prevents any data loss
+        const mergedProds = mergeProducts(products, res.data.products || []);
+        const mergedSales = mergeSales(sales, res.data.sales || []);
+        const mergedCusts = mergeCustomers(customers, res.data.customers || []);
+        const mergedPays = mergePayments(payments, res.data.payments || []);
+        const mergedExps = mergeExpenses(expenses, res.data.expenses || []);
 
+        setProducts(mergedProds);
+        setSales(mergedSales);
+        setCustomers(mergedCusts);
+        setPayments(mergedPays);
+        setExpenses(mergedExps);
+
+        const updatedSettings: StoreSettings = {
+          ...settings,
+          ...(res.data.settings || {}),
+          spreadsheetId: targetSheetId,
+          spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
+          syncStatus: 'synced',
+          lastSyncTime: new Date().toISOString(),
+          syncError: undefined,
+        };
+        setSettings(updatedSettings);
         setIsGoogleConnected(true);
-        return { success: true, message: 'গুগল শিট থেকে সমস্ত ডাটা সফলভাবে ফোনে লোড ও সিঙ্ক করা হয়েছে!' };
+
+        // Immediate background write-back of merged data so cloud spreadsheet is also 100% deduplicated & synchronized
+        GoogleSheetsService.syncAllData(targetSheetId, {
+          products: mergedProds,
+          sales: mergedSales,
+          customers: mergedCusts,
+          payments: mergedPays,
+          expenses: mergedExps,
+          settings: updatedSettings,
+        }).catch((syncErr) => console.warn('Background write-back sync after pull:', syncErr));
+
+        return { success: true, message: 'গুগল শিট থেকে ডাটা ডুপ্লিকেট ছাড়া সঠিকভাবে মার্জ ও সিঙ্ক করা হয়েছে!' };
       } else {
         setSettings((prev) => ({ ...prev, syncStatus: 'error', syncError: res.message }));
         return { success: false, message: res.message };
@@ -986,34 +1089,54 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     try {
       setSettings((prev) => ({ ...prev, syncStatus: 'syncing' }));
 
-      // If connecting a new sheet from another device (or sheetId provided explicitly),
-      // let's try pulling existing data first
-      if (sheetId && sheetId !== settings.spreadsheetId) {
-        if (!GoogleSheetsService.getToken()) {
-          try {
-            await GoogleSheetsService.requestAuth();
-          } catch (gisErr) {
-            await googleSignIn(true);
-          }
+      // Ensure valid auth token before performing sync
+      let token = await GoogleSheetsService.getValidTokenOrRefresh(false);
+      if (!token) {
+        try {
+          token = await GoogleSheetsService.requestAuth(undefined, true);
+        } catch {
+          await googleSignIn(true);
         }
+      }
 
+      // If connecting a new sheet from another device (or sheetId provided explicitly),
+      // merge existing cloud sheet data with local data first so nothing is lost
+      if (sheetId && sheetId !== settings.spreadsheetId) {
         const pullRes = await GoogleSheetsService.fetchDataFromGoogleSheets(targetSheetId);
-        if (pullRes.success && pullRes.data && pullRes.data.products && pullRes.data.products.length > 0) {
-          setProducts(pullRes.data.products);
-          if (pullRes.data.sales) setSales(pullRes.data.sales);
-          if (pullRes.data.customers) setCustomers(pullRes.data.customers);
-          if (pullRes.data.payments) setPayments(pullRes.data.payments);
-          if (pullRes.data.expenses) setExpenses(pullRes.data.expenses);
-          setSettings((prev) => ({
-            ...prev,
+        if (pullRes.success && pullRes.data) {
+          const mergedProds = mergeProducts(products, pullRes.data.products || []);
+          const mergedSales = mergeSales(sales, pullRes.data.sales || []);
+          const mergedCusts = mergeCustomers(customers, pullRes.data.customers || []);
+          const mergedPays = mergePayments(payments, pullRes.data.payments || []);
+          const mergedExps = mergeExpenses(expenses, pullRes.data.expenses || []);
+
+          setProducts(mergedProds);
+          setSales(mergedSales);
+          setCustomers(mergedCusts);
+          setPayments(mergedPays);
+          setExpenses(mergedExps);
+
+          const newSettings: StoreSettings = {
+            ...settings,
             spreadsheetId: targetSheetId,
             spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
             syncStatus: 'synced',
             lastSyncTime: new Date().toISOString(),
             syncError: undefined,
-          }));
+          };
+          setSettings(newSettings);
           setIsGoogleConnected(true);
-          return { success: true, message: 'বিদ্যমান গুগল শিট ডাটাবেজের সাথে সফলভাবে কানেক্ট ও ডাটা লোড হয়েছে!' };
+
+          await GoogleSheetsService.syncAllData(targetSheetId, {
+            products: mergedProds,
+            sales: mergedSales,
+            customers: mergedCusts,
+            payments: mergedPays,
+            expenses: mergedExps,
+            settings: newSettings,
+          });
+
+          return { success: true, message: 'বিদ্যমান গুগল শিট ডাটাবেজের সাথে সফলভাবে কানেক্ট ও ডাটা ডুপ্লিকেট ছাড়া মার্জ হয়েছে!' };
         }
       }
 
@@ -1023,19 +1146,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         customers,
         payments,
         expenses,
-        settings,
+        settings: { ...settings, spreadsheetId: targetSheetId },
       });
 
       if (res.success) {
         setSettings((prev) => ({
           ...prev,
           spreadsheetId: targetSheetId,
+          spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSheetId}/edit`,
           syncStatus: 'synced',
           lastSyncTime: new Date().toISOString(),
           syncError: undefined,
         }));
         setIsGoogleConnected(true);
-        return { success: true, message: 'Store database synced with Google Sheets successfully!' };
+        return { success: true, message: 'গুগল শিটে সমস্ত ডাটা সফলভাবে সংরক্ষিত হয়েছে!' };
       } else {
         setSettings((prev) => ({ ...prev, syncStatus: 'error', syncError: res.message }));
         return { success: false, message: res.message };
@@ -1156,7 +1280,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     });
   };
 
-  const clearDatabase = useCallback(() => {
+  const clearDatabase = useCallback(async () => {
+    clearAllDeletedIds();
+    if (settings.spreadsheetId) {
+      try {
+        await GoogleSheetsService.clearAllSpreadsheetData(settings.spreadsheetId);
+      } catch (e) {
+        console.warn('Could not clear spreadsheet remotely:', e);
+      }
+    }
     setProducts([]);
     setSales([]);
     setCustomers([]);
@@ -1164,14 +1296,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setExpenses([]);
     setCart([]);
     setLastSale(null);
-    // Optional: could reset settings, but usually users want to keep their shop name/settings.
     localStorage.removeItem(STORAGE_KEYS.PRODUCTS);
     localStorage.removeItem(STORAGE_KEYS.SALES);
     localStorage.removeItem(STORAGE_KEYS.CUSTOMERS);
     localStorage.removeItem(STORAGE_KEYS.PAYMENTS);
     localStorage.removeItem(STORAGE_KEYS.EXPENSES);
     window.location.reload();
-  }, []);
+  }, [settings.spreadsheetId]);
 
   const signOut = () => {
     firebaseLogout();
@@ -1210,7 +1341,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         restockProduct,
         addCustomer,
         updateCustomer,
+        deleteCustomer,
         receiveCustomerPayment,
+        deletePayment,
         addExpense,
         deleteExpense,
         updateSettings,

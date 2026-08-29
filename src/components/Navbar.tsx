@@ -51,6 +51,19 @@ export const Navbar: React.FC = () => {
             <span className="sm:hidden">Sheets</span>
           </button>
         );
+      case 'needs_auth':
+        return (
+          <button
+            id="btn-sync-status"
+            onClick={() => setShowSheetsModal(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300 border border-amber-300 dark:border-amber-700 rounded-full hover:bg-amber-100 transition-colors"
+            title="গুগল সেশন রিনিউ করতে ক্লিক করুন"
+          >
+            <RefreshCw className="w-3.5 h-3.5 text-amber-600 animate-pulse" />
+            <span className="hidden sm:inline">রিনিউ সেশন (১-ক্লিক)</span>
+            <span className="sm:hidden">রিনিউ</span>
+          </button>
+        );
       case 'error':
         return (
           <button

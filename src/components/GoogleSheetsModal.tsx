@@ -137,6 +137,24 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
     }
   };
 
+  const handleRenewAuth = async () => {
+    setIsBusy(true);
+    setStatusMessage(null);
+    try {
+      await GoogleSheetsService.requestAuth();
+      const res = await syncWithGoogleSheets();
+      if (res.success) {
+        setStatusMessage({ type: 'success', text: 'গুগল সেশন সফলভাবে রিনিউ ও ডাটা সিঙ্ক হয়েছে!' });
+      } else {
+        setStatusMessage({ type: 'error', text: res.message });
+      }
+    } catch (err: any) {
+      setStatusMessage({ type: 'error', text: err?.message || 'লগইন সেশন রিনিউ করতে সমস্যা হয়েছে' });
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto">
       <div className="bg-white dark:bg-slate-800 rounded-2xl max-w-lg w-full border border-slate-200 dark:border-slate-700 shadow-2xl p-5 space-y-4 animate-in fade-in zoom-in-95 my-4">
@@ -284,6 +302,23 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({ onClose })
           {settings.spreadsheetId ? (
             /* IF CONNECTED: Show Sync & Pull Controls */
             <div className="space-y-2">
+              {(!GoogleSheetsService.getToken() || settings.syncStatus === 'needs_auth') && (
+                <div className="p-2.5 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-xl flex items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-1.5 text-amber-800 dark:text-amber-300 font-bold">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+                    <span>গুগল সেশন এক্সপায়ার হয়েছে</span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={isBusy}
+                    onClick={handleRenewAuth}
+                    className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-bold shadow-xs transition-colors cursor-pointer shrink-0"
+                  >
+                    সেশন রিনিউ করুন (১-ক্লিক)
+                  </button>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <button
                   id="btn-pull-sheets-data"

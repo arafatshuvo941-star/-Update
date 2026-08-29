@@ -17,6 +17,7 @@ import {
   X,
   History,
   Plus,
+  Trash2,
 } from 'lucide-react';
 
 export const CustomersManager: React.FC = () => {
@@ -26,6 +27,7 @@ export const CustomersManager: React.FC = () => {
     sales,
     addCustomer,
     updateCustomer,
+    deleteCustomer,
     receiveCustomerPayment,
     settings,
     t,
@@ -322,6 +324,19 @@ export const CustomersManager: React.FC = () => {
                     title="কাস্টমার তথ্য সংশোধন"
                   >
                     <Users className="w-3.5 h-3.5" />
+                  </button>
+
+                  {/* Delete Customer */}
+                  <button
+                    onClick={() => {
+                      if (window.confirm(`আপনি কি কাস্টমার "${cust.name}" মুছে ফেলতে চান? এটি স্থায়ীভাবে ডাটাবেজ এবং গুগল শিট থেকে ডিলিট হয়ে যাবে।`)) {
+                        deleteCustomer(cust.id);
+                      }
+                    }}
+                    className="p-2 bg-slate-100 dark:bg-slate-800 hover:bg-rose-50 hover:text-rose-600 text-slate-400 rounded-xl transition-colors"
+                    title="কাস্টমার মুছে ফেলুন"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
                   </button>
                 </div>
               </div>

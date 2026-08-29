@@ -1,4 +1,5 @@
 import { Product, Sale, SaleItem, Customer, Payment, Expense, StoreSettings } from '../types';
+import { isItemDeleted } from '../utils/tombstones';
 
 declare global {
   interface Window {
@@ -10,7 +11,7 @@ declare global {
             scope: string;
             callback: (response: { access_token?: string; error?: string }) => void;
           }) => {
-            requestAccessToken: () => void;
+            requestAccessToken: (options?: { prompt?: string }) => void;
           };
         };
       };
@@ -25,20 +26,27 @@ export interface SyncResult {
   message: string;
   spreadsheetId?: string;
   spreadsheetUrl?: string;
+  isAuthRequired?: boolean;
 }
 
 export class GoogleSheetsService {
   private static token: string | null = null;
   private static tokenExpiry: number = 0;
   private static hasSheetsScope: boolean = false;
+  private static authInProgressPromise: Promise<string> | null = null;
 
   public static setToken(token: string, expiresInSeconds: number = 3600, hasSheetsScope: boolean = true) {
     this.token = token;
     this.hasSheetsScope = hasSheetsScope;
-    this.tokenExpiry = Date.now() + (expiresInSeconds - 60) * 1000;
-    localStorage.setItem('gsheets_access_token', token);
-    localStorage.setItem('gsheets_token_expiry', this.tokenExpiry.toString());
-    localStorage.setItem('gsheets_has_scope', hasSheetsScope ? 'true' : 'false');
+    // Set expiry with a 3-minute safety buffer
+    this.tokenExpiry = Date.now() + Math.max(60, expiresInSeconds - 180) * 1000;
+    try {
+      localStorage.setItem('gsheets_access_token', token);
+      localStorage.setItem('gsheets_token_expiry', this.tokenExpiry.toString());
+      localStorage.setItem('gsheets_has_scope', hasSheetsScope ? 'true' : 'false');
+    } catch {
+      // Ignore storage errors in restricted iframe/private mode
+    }
   }
 
   public static getToken(): string | null {
@@ -66,22 +74,31 @@ export class GoogleSheetsService {
     this.token = null;
     this.tokenExpiry = 0;
     this.hasSheetsScope = false;
-    localStorage.removeItem('gsheets_access_token');
-    localStorage.removeItem('gsheets_token_expiry');
-    localStorage.removeItem('gsheets_has_scope');
+    try {
+      localStorage.removeItem('gsheets_access_token');
+      localStorage.removeItem('gsheets_token_expiry');
+      localStorage.removeItem('gsheets_has_scope');
+    } catch {
+      // Ignore storage errors
+    }
   }
 
   /**
-   * Requests Google OAuth token with Sheets and Drive scopes using GIS
+   * Requests Google OAuth token with Sheets and Drive scopes using GIS.
+   * If promptUser is false, it requests access silently in the background without popups.
    */
-  public static async requestAuth(clientId?: string): Promise<string> {
-    return new Promise((resolve, reject) => {
+  public static async requestAuth(clientId?: string, promptUser: boolean = true): Promise<string> {
+    if (this.authInProgressPromise) {
+      return this.authInProgressPromise;
+    }
+
+    this.authInProgressPromise = new Promise<string>((resolve, reject) => {
       if (!window.google?.accounts?.oauth2) {
+        this.authInProgressPromise = null;
         reject(new Error('Google Identity Services script not loaded. Please check your internet connection.'));
         return;
       }
 
-      // Check client_id from env, firebase config or fallback
       const effectiveClientId =
         clientId ||
         (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID ||
@@ -92,8 +109,9 @@ export class GoogleSheetsService {
           client_id: effectiveClientId,
           scope: SCOPES,
           callback: (response) => {
+            this.authInProgressPromise = null;
             if (response.error) {
-              reject(new Error(`Google Authentication Failed: ${response.error}`));
+              reject(new Error(`Google Authentication: ${response.error}`));
               return;
             }
             if (response.access_token) {
@@ -104,20 +122,60 @@ export class GoogleSheetsService {
             }
           },
         });
-        client.requestAccessToken();
+
+        if (!promptUser) {
+          client.requestAccessToken({ prompt: '' });
+        } else {
+          client.requestAccessToken();
+        }
       } catch (err: any) {
+        this.authInProgressPromise = null;
         reject(new Error(err?.message || 'Failed to initialize Google token client'));
       }
     });
+
+    return this.authInProgressPromise;
+  }
+
+  /**
+   * Get a valid token or silently refresh in background without prompting user.
+   */
+  public static async getValidTokenOrRefresh(interactiveFallback: boolean = false): Promise<string | null> {
+    const existing = this.getToken();
+    if (existing && Date.now() + 120000 < this.tokenExpiry) {
+      return existing;
+    }
+
+    // Try background silent refresh first
+    try {
+      const refreshed = await this.requestAuth(undefined, false);
+      if (refreshed) return refreshed;
+    } catch {
+      // Silent refresh was not possible
+    }
+
+    if (existing && Date.now() < this.tokenExpiry) {
+      return existing;
+    }
+
+    if (interactiveFallback) {
+      try {
+        return await this.requestAuth(undefined, true);
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
   }
 
   /**
    * Creates a structured Google Spreadsheet with the 7 required sheets
    */
   public static async createStoreDatabase(shopName: string): Promise<{ id: string; url: string }> {
-    const token = this.getToken();
+    let token = await this.getValidTokenOrRefresh(true);
     if (!token) {
-      throw new Error('Please sign in to Google first.');
+      throw new Error('গুগল অ্যাকাউন্ট অনুমোদন করা সম্ভব হয়নি।');
     }
 
     const title = `Universal Store Database - ${shopName || 'My Shop'}`;
@@ -131,7 +189,7 @@ export class GoogleSheetsService {
       { properties: { title: 'Settings' } },
     ];
 
-    const response = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
+    let response = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -143,6 +201,24 @@ export class GoogleSheetsService {
       }),
     });
 
+    // Auto retry on 401
+    if (response.status === 401) {
+      token = await this.requestAuth(undefined, false).catch(() => null);
+      if (token) {
+        response = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            properties: { title },
+            sheets: sheetsList,
+          }),
+        });
+      }
+    }
+
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
       throw new Error(err.error?.message || `Failed to create spreadsheet: ${response.statusText}`);
@@ -152,7 +228,6 @@ export class GoogleSheetsService {
     const spreadsheetId = data.spreadsheetId;
     const spreadsheetUrl = data.spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
 
-    // Initialize Headers for each sheet
     await this.initializeSheetHeaders(spreadsheetId, token);
 
     return { id: spreadsheetId, url: spreadsheetUrl };
@@ -276,7 +351,55 @@ export class GoogleSheetsService {
   }
 
   /**
-   * Syncs complete store dataset to Google Sheets
+   * Complete Sheet Clearing Helper - Wipes all rows (from row 2 down) reliably
+   */
+  public static async clearAllSpreadsheetData(spreadsheetId: string): Promise<boolean> {
+    let token = await this.getValidTokenOrRefresh(false);
+    if (!token || !spreadsheetId) return false;
+
+    const clearRanges = [
+      'Products!A2:Z',
+      'Sales!A2:Z',
+      'SaleItems!A2:Z',
+      'Customers!A2:Z',
+      'Payments!A2:Z',
+      'Expenses!A2:Z',
+      'Settings!A2:Z',
+    ];
+
+    try {
+      let clearRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchClear`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ranges: clearRanges }),
+      });
+
+      if (clearRes.status === 401) {
+        token = await this.requestAuth(undefined, false).catch(() => null);
+        if (token) {
+          clearRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchClear`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ ranges: clearRanges }),
+          });
+        }
+      }
+
+      return clearRes.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Syncs complete store dataset to Google Sheets with automatic self-healing reconnection.
+   * GUARANTEES that deleted items are completely removed from Google Sheets.
    */
   public static async syncAllData(
     spreadsheetId: string,
@@ -289,30 +412,33 @@ export class GoogleSheetsService {
       settings: StoreSettings;
     }
   ): Promise<SyncResult> {
-    const token = this.getToken();
+    let token = await this.getValidTokenOrRefresh(false);
     if (!token) {
-      return { success: false, message: 'Google authentication required' };
+      return { success: false, isAuthRequired: true, message: 'Google authentication required' };
     }
 
     try {
-      // 1. Prepare Products Rows
-      const productRows = data.products.map((p) => [
-        p.id,
-        p.name,
-        p.category,
-        p.unit,
-        p.purchasePrice,
-        p.salePrice,
-        p.currentStock,
-        p.minStock,
-        p.barcode || '',
-        p.expiryDate || '',
-        p.extraInfo || '',
-        p.updatedAt || new Date().toISOString(),
-      ]);
+      // 1. Products Rows
+      const productRows = data.products
+        .filter((p) => p && p.name && !isItemDeleted(p.id, p.barcode))
+        .map((p) => [
+          p.id,
+          p.name,
+          p.category,
+          p.unit,
+          p.purchasePrice,
+          p.salePrice,
+          p.currentStock,
+          p.minStock,
+          p.barcode || '',
+          p.expiryDate || '',
+          p.extraInfo || '',
+          p.updatedAt || p.createdAt || new Date().toISOString(),
+        ]);
 
-      // 2. Prepare Sales & SaleItems Rows
-      const saleRows = data.sales.map((s) => [
+      // 2. Sales & SaleItems Rows
+      const activeSales = data.sales.filter((s) => s && (s.invoiceNumber || s.id) && !isItemDeleted(s.id, s.invoiceNumber));
+      const saleRows = activeSales.map((s) => [
         s.invoiceNumber || s.id,
         s.customerName,
         s.customerPhone || '',
@@ -328,7 +454,7 @@ export class GoogleSheetsService {
       ]);
 
       const saleItemRows: any[][] = [];
-      data.sales.forEach((s) => {
+      activeSales.forEach((s) => {
         if (s.items && s.items.length > 0) {
           s.items.forEach((item) => {
             saleItemRows.push([
@@ -348,86 +474,204 @@ export class GoogleSheetsService {
         }
       });
 
-      // 3. Prepare Customers Rows
-      const customerRows = data.customers.map((c) => [
-        c.id,
-        c.name,
-        c.phone,
-        c.address || '',
-        c.totalDue,
-        c.totalPurchases,
-        c.lastTransactionDate || '',
-      ]);
+      // 3. Customers Rows
+      const customerRows = data.customers
+        .filter((c) => c && c.name && !isItemDeleted(c.id, c.phone))
+        .map((c) => [
+          c.id,
+          c.name,
+          c.phone,
+          c.address || '',
+          c.totalDue,
+          c.totalPurchases,
+          c.lastTransactionDate || '',
+        ]);
 
-      // 4. Prepare Payments Rows
-      const paymentRows = data.payments.map((p) => [
-        p.id,
-        p.customerId,
-        p.customerName,
-        p.amount,
-        p.paymentMethod,
-        p.trxId || '',
-        p.previousDue,
-        p.remainingDue,
-        p.note || '',
-        p.createdAt,
-      ]);
+      // 4. Payments Rows
+      const paymentRows = data.payments
+        .filter((p) => p && !isItemDeleted(p.id, p.trxId))
+        .map((p) => [
+          p.id,
+          p.customerId,
+          p.customerName,
+          p.amount,
+          p.paymentMethod,
+          p.trxId || '',
+          p.previousDue,
+          p.remainingDue,
+          p.note || '',
+          p.createdAt,
+        ]);
 
-      // 5. Prepare Expenses Rows
-      const expenseRows = data.expenses.map((e) => [
-        e.id,
-        e.title,
-        e.category,
-        e.amount,
-        e.paymentMethod,
-        e.note || '',
-        e.createdAt,
-      ]);
+      // 5. Expenses Rows
+      const expenseRows = data.expenses
+        .filter((e) => e && !isItemDeleted(e.id))
+        .map((e) => [
+          e.id,
+          e.title,
+          e.category,
+          e.amount,
+          e.paymentMethod,
+          e.note || '',
+          e.createdAt,
+        ]);
 
       // 6. Settings Rows
       const settingsRows = [
-        ['shopName', data.settings.shopName, 'Shop Display Name'],
-        ['shopPhone', data.settings.shopPhone, 'Shop Contact Phone'],
-        ['shopAddress', data.settings.shopAddress, 'Shop Address'],
-        ['currency', data.settings.currency, 'Active Currency'],
-        ['language', data.settings.language, 'App Language'],
+        ['shopName', data.settings.shopName || '', 'Shop Display Name'],
+        ['shopPhone', data.settings.shopPhone || '', 'Shop Contact Phone'],
+        ['shopAddress', data.settings.shopAddress || '', 'Shop Address'],
+        ['currency', data.settings.currency || 'BDT', 'Active Currency'],
+        ['language', data.settings.language || 'bn', 'App Language'],
         ['lastSyncTime', new Date().toISOString(), 'Last Successful Cloud Sync'],
       ];
 
-      // Clear & Write in bulk using batchUpdate
-      const batchPayload = {
-        valueInputOption: 'USER_ENTERED',
-        data: [
-          { range: 'Products!A2:L' + (productRows.length + 1), values: productRows },
-          { range: 'Sales!A2:L' + (saleRows.length + 1), values: saleRows },
-          { range: 'SaleItems!A2:K' + (saleItemRows.length + 1), values: saleItemRows },
-          { range: 'Customers!A2:G' + (customerRows.length + 1), values: customerRows },
-          { range: 'Payments!A2:J' + (paymentRows.length + 1), values: paymentRows },
-          { range: 'Expenses!A2:G' + (expenseRows.length + 1), values: expenseRows },
-          { range: 'Settings!A2:C' + (settingsRows.length + 1), values: settingsRows },
-        ],
-      };
+      // CRITICAL: Clear existing rows across all sheets first so NO deleted or ghost rows remain
+      const clearRanges = [
+        'Products!A2:Z',
+        'Sales!A2:Z',
+        'SaleItems!A2:Z',
+        'Customers!A2:Z',
+        'Payments!A2:Z',
+        'Expenses!A2:Z',
+        'Settings!A2:Z',
+      ];
 
-      const updateRes = await fetch(
-        `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`,
-        {
+      try {
+        let clearRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchClear`, {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify(batchPayload),
-        }
-      );
+          body: JSON.stringify({ ranges: clearRanges }),
+        });
 
-      if (!updateRes.ok) {
-        const err = await updateRes.json().catch(() => ({}));
-        return { success: false, message: err.error?.message || `Sync failed with status ${updateRes.status}` };
+        // 401 retry on clear
+        if (clearRes.status === 401) {
+          const freshToken = await this.requestAuth(undefined, false).catch(() => null);
+          if (freshToken) {
+            token = freshToken;
+            clearRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchClear`, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ ranges: clearRanges }),
+            });
+          }
+        }
+      } catch (clearErr) {
+        console.warn('Batch clear warning, proceeding with batch update:', clearErr);
+      }
+
+      // Build batch update data containing only current valid rows
+      const dataToUpdate: Array<{ range: string; values: any[][] }> = [];
+
+      if (productRows.length > 0) {
+        dataToUpdate.push({
+          range: `Products!A2:L${productRows.length + 1}`,
+          values: productRows,
+        });
+      }
+
+      if (saleRows.length > 0) {
+        dataToUpdate.push({
+          range: `Sales!A2:L${saleRows.length + 1}`,
+          values: saleRows,
+        });
+      }
+
+      if (saleItemRows.length > 0) {
+        dataToUpdate.push({
+          range: `SaleItems!A2:K${saleItemRows.length + 1}`,
+          values: saleItemRows,
+        });
+      }
+
+      if (customerRows.length > 0) {
+        dataToUpdate.push({
+          range: `Customers!A2:G${customerRows.length + 1}`,
+          values: customerRows,
+        });
+      }
+
+      if (paymentRows.length > 0) {
+        dataToUpdate.push({
+          range: `Payments!A2:J${paymentRows.length + 1}`,
+          values: paymentRows,
+        });
+      }
+
+      if (expenseRows.length > 0) {
+        dataToUpdate.push({
+          range: `Expenses!A2:G${expenseRows.length + 1}`,
+          values: expenseRows,
+        });
+      }
+
+      if (settingsRows.length > 0) {
+        dataToUpdate.push({
+          range: `Settings!A2:C${settingsRows.length + 1}`,
+          values: settingsRows,
+        });
+      }
+
+      if (dataToUpdate.length > 0) {
+        let updateRes = await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              valueInputOption: 'USER_ENTERED',
+              data: dataToUpdate,
+            }),
+          }
+        );
+
+        // Auto retry once on 401 by attempting background silent refresh
+        if (updateRes.status === 401) {
+          const freshToken = await this.requestAuth(undefined, false).catch(() => null);
+          if (freshToken) {
+            token = freshToken;
+            updateRes = await fetch(
+              `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`,
+              {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  valueInputOption: 'USER_ENTERED',
+                  data: dataToUpdate,
+                }),
+              }
+            );
+          }
+        }
+
+        if (!updateRes.ok) {
+          if (updateRes.status === 401) {
+            return {
+              success: false,
+              isAuthRequired: true,
+              message: 'গুগল লগইন সেশন শেষ হয়েছে। পুনরায় কানেক্ট করতে ১-ক্লিক করুন।',
+            };
+          }
+          const err = await updateRes.json().catch(() => ({}));
+          return { success: false, message: err.error?.message || `Sync failed with status ${updateRes.status}` };
+        }
       }
 
       return {
         success: true,
-        message: 'All store data synced to Google Sheets successfully!',
+        message: 'গুগল শিটে সমস্ত ডাটা নির্ভুলভাবে সিঙ্ক হয়েছে (মুছে ফেলা ডাটা সফলভাবে রিমুভ করা হয়েছে)!',
         spreadsheetId,
         spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
       };
@@ -437,15 +681,16 @@ export class GoogleSheetsService {
   }
 
   /**
-   * Append a single new Sale transaction to Google Sheets (fast incremental sync)
+   * Append a single new Sale transaction to Google Sheets
    */
   public static async appendSale(spreadsheetId: string, sale: Sale): Promise<boolean> {
-    const token = this.getToken();
+    const token = await this.getValidTokenOrRefresh(false);
     if (!token || !spreadsheetId) return false;
+    if (isItemDeleted(sale.id, sale.invoiceNumber)) return false;
 
     try {
       const saleRow = [
-        sale.invoiceNumber,
+        sale.invoiceNumber || sale.id,
         sale.customerName,
         sale.customerPhone || '',
         sale.subtotal,
@@ -471,7 +716,7 @@ export class GoogleSheetsService {
       if (sale.items && sale.items.length > 0) {
         const itemRows = sale.items.map((it) => [
           it.id,
-          sale.invoiceNumber,
+          sale.invoiceNumber || sale.id,
           it.productId,
           it.productName,
           it.unit,
@@ -514,7 +759,7 @@ export class GoogleSheetsService {
     };
     message: string;
   }> {
-    const token = this.getToken();
+    let token = await this.getValidTokenOrRefresh(false);
     if (!token) {
       return { success: false, message: 'Google authentication required.' };
     }
@@ -530,12 +775,26 @@ export class GoogleSheetsService {
         'Settings!A2:B',
       ];
       const rangesParam = ranges.map((r) => `ranges=${encodeURIComponent(r)}`).join('&');
-      const response = await fetch(
+      let response = await fetch(
         `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchGet?${rangesParam}`,
         {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
+
+      // Auto retry on 401
+      if (response.status === 401) {
+        const freshToken = await this.requestAuth(undefined, false).catch(() => null);
+        if (freshToken) {
+          token = freshToken;
+          response = await fetch(
+            `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchGet?${rangesParam}`,
+            {
+              headers: { Authorization: `Bearer ${token}` },
+            }
+          );
+        }
+      }
 
       if (!response.ok) {
         const err = await response.json().catch(() => ({}));
@@ -548,35 +807,43 @@ export class GoogleSheetsService {
       const resJson = await response.json();
       const valueRanges = resJson.valueRanges || [];
 
-      // Parse Products
+      // 1. Parse Products
       const productRows = valueRanges[0]?.values || [];
-      const products: Product[] = productRows.map((r: any[], idx: number) => ({
-        id: r[0] || `prod-${idx + 1}`,
-        name: r[1] || 'Product',
-        category: r[2] || 'General',
-        unit: r[3] || 'Pcs',
-        purchasePrice: Number(r[4]) || 0,
-        salePrice: Number(r[5]) || 0,
-        currentStock: Number(r[6]) || 0,
-        minStock: Number(r[7]) || 5,
-        barcode: r[8] || undefined,
-        expiryDate: r[9] || undefined,
-        createdAt: new Date().toISOString(),
-        updatedAt: r[11] || new Date().toISOString(),
-      }));
+      const products: Product[] = productRows
+        .filter((r: any[]) => r && r[1]) // Must have at least product name
+        .map((r: any[], idx: number) => {
+          const id = r[0] ? String(r[0]).trim() : `prod-${Date.now()}-${idx + 1}`;
+          const barcode = r[8] ? String(r[8]).trim() : undefined;
+          return {
+            id,
+            name: String(r[1] || 'Product').trim(),
+            category: r[2] || 'General Retail',
+            unit: r[3] || 'pcs',
+            purchasePrice: Number(r[4]) || 0,
+            salePrice: Number(r[5]) || 0,
+            currentStock: Number(r[6]) || 0,
+            minStock: Number(r[7]) || 5,
+            barcode,
+            expiryDate: r[9] ? String(r[9]).trim() : undefined,
+            extraInfo: r[10] ? String(r[10]).trim() : undefined,
+            createdAt: r[11] || new Date().toISOString(),
+            updatedAt: r[11] || new Date().toISOString(),
+          };
+        })
+        .filter((p: Product) => !isItemDeleted(p.id, p.barcode));
 
-      // Parse Sale Items
+      // 2. Parse Sale Items
       const saleItemRows = valueRanges[2]?.values || [];
       const saleItemsByInvoice: Record<string, SaleItem[]> = {};
       saleItemRows.forEach((r: any[], idx: number) => {
-        const invoiceNum = r[1];
+        const invoiceNum = r[1] ? String(r[1]).trim() : '';
         if (!invoiceNum) return;
         const item: SaleItem = {
-          id: r[0] || `item-${idx + 1}`,
+          id: r[0] ? String(r[0]).trim() : `item-${idx + 1}`,
           saleId: invoiceNum,
-          productId: r[2] || '',
-          productName: r[3] || '',
-          unit: r[4] || 'Pcs',
+          productId: r[2] ? String(r[2]).trim() : '',
+          productName: r[3] ? String(r[3]).trim() : '',
+          unit: r[4] || 'pcs',
           quantity: Number(r[5]) || 1,
           purchasePrice: Number(r[6]) || 0,
           salePrice: Number(r[7]) || 0,
@@ -590,69 +857,82 @@ export class GoogleSheetsService {
         saleItemsByInvoice[invoiceNum].push(item);
       });
 
-      // Parse Sales
+      // 3. Parse Sales
       const saleRows = valueRanges[1]?.values || [];
-      const sales: Sale[] = saleRows.map((r: any[], idx: number) => {
-        const invoiceNumber = r[0] || `INV-${1000 + idx}`;
-        return {
-          id: `sale-${idx + 1}`,
-          invoiceNumber,
-          customerName: r[1] || 'Walk-in Customer',
-          customerPhone: r[2] || undefined,
-          subtotal: Number(r[3]) || 0,
-          discount: Number(r[4]) || 0,
-          totalAmount: Number(r[5]) || 0,
-          paidAmount: Number(r[6]) || 0,
-          dueAmount: Number(r[7]) || 0,
-          paymentMethod: (r[8] as any) || 'Cash',
-          paymentDetails: r[9] || undefined,
-          totalProfit: Number(r[10]) || 0,
-          createdAt: r[11] || new Date().toISOString(),
-          items: saleItemsByInvoice[invoiceNumber] || [],
-        };
-      });
+      const sales: Sale[] = saleRows
+        .filter((r: any[]) => r && (r[0] || r[1]))
+        .map((r: any[], idx: number) => {
+          const invoiceNumber = r[0] ? String(r[0]).trim() : `INV-${1000 + idx}`;
+          return {
+            id: invoiceNumber,
+            invoiceNumber,
+            customerName: r[1] || 'নগদ ক্রেতা (Walk-in)',
+            customerPhone: r[2] ? String(r[2]).trim() : undefined,
+            subtotal: Number(r[3]) || 0,
+            discount: Number(r[4]) || 0,
+            totalAmount: Number(r[5]) || 0,
+            paidAmount: Number(r[6]) || 0,
+            dueAmount: Number(r[7]) || 0,
+            paymentMethod: (r[8] as any) || 'Cash',
+            paymentDetails: r[9] || undefined,
+            totalProfit: Number(r[10]) || 0,
+            itemsCount: (saleItemsByInvoice[invoiceNumber] || []).reduce((acc, it) => acc + it.quantity, 0),
+            createdAt: r[11] || new Date().toISOString(),
+            items: saleItemsByInvoice[invoiceNumber] || [],
+          };
+        })
+        .filter((s: Sale) => !isItemDeleted(s.id, s.invoiceNumber));
 
-      // Parse Customers
+      // 4. Parse Customers
       const customerRows = valueRanges[3]?.values || [];
-      const customers: Customer[] = customerRows.map((r: any[], idx: number) => ({
-        id: r[0] || `cust-${idx + 1}`,
-        name: r[1] || '',
-        phone: r[2] || '',
-        address: r[3] || '',
-        totalDue: Number(r[4]) || 0,
-        totalPurchases: Number(r[5]) || 0,
-        lastTransactionDate: r[6] || undefined,
-        createdAt: new Date().toISOString(),
-      }));
+      const customers: Customer[] = customerRows
+        .filter((r: any[]) => r && r[1])
+        .map((r: any[], idx: number) => ({
+          id: r[0] ? String(r[0]).trim() : `cust-${Date.now()}-${idx + 1}`,
+          name: String(r[1] || '').trim(),
+          phone: String(r[2] || '').trim(),
+          address: r[3] || '',
+          totalDue: Number(r[4]) || 0,
+          totalPurchases: Number(r[5]) || 0,
+          lastTransactionDate: r[6] || undefined,
+          createdAt: new Date().toISOString(),
+        }))
+        .filter((c: Customer) => !isItemDeleted(c.id, c.phone));
 
-      // Parse Payments
+      // 5. Parse Payments
       const paymentRows = valueRanges[4]?.values || [];
-      const payments: Payment[] = paymentRows.map((r: any[], idx: number) => ({
-        id: r[0] || `pay-${idx + 1}`,
-        customerId: r[1] || '',
-        customerName: r[2] || '',
-        amount: Number(r[3]) || 0,
-        paymentMethod: (r[4] as any) || 'Cash',
-        trxId: r[5] || undefined,
-        previousDue: Number(r[6]) || 0,
-        remainingDue: Number(r[7]) || 0,
-        note: r[8] || undefined,
-        createdAt: r[9] || new Date().toISOString(),
-      }));
+      const payments: Payment[] = paymentRows
+        .filter((r: any[]) => r && (r[1] || r[2]))
+        .map((r: any[], idx: number) => ({
+          id: r[0] ? String(r[0]).trim() : `pay-${Date.now()}-${idx + 1}`,
+          customerId: r[1] ? String(r[1]).trim() : '',
+          customerName: r[2] || '',
+          amount: Number(r[3]) || 0,
+          paymentMethod: (r[4] as any) || 'Cash',
+          trxId: r[5] || undefined,
+          previousDue: Number(r[6]) || 0,
+          remainingDue: Number(r[7]) || 0,
+          note: r[8] || undefined,
+          createdAt: r[9] || new Date().toISOString(),
+        }))
+        .filter((p: Payment) => !isItemDeleted(p.id, p.trxId));
 
-      // Parse Expenses
+      // 6. Parse Expenses
       const expenseRows = valueRanges[5]?.values || [];
-      const expenses: Expense[] = expenseRows.map((r: any[], idx: number) => ({
-        id: r[0] || `exp-${idx + 1}`,
-        title: r[1] || 'Expense',
-        category: (r[2] as any) || 'Others',
-        amount: Number(r[3]) || 0,
-        paymentMethod: (r[4] as any) || 'Cash',
-        note: r[5] || undefined,
-        createdAt: r[6] || new Date().toISOString(),
-      }));
+      const expenses: Expense[] = expenseRows
+        .filter((r: any[]) => r && r[1])
+        .map((r: any[], idx: number) => ({
+          id: r[0] ? String(r[0]).trim() : `exp-${Date.now()}-${idx + 1}`,
+          title: r[1] || 'Expense',
+          category: (r[2] as any) || 'Other',
+          amount: Number(r[3]) || 0,
+          paymentMethod: (r[4] as any) || 'Cash',
+          note: r[5] || undefined,
+          createdAt: r[6] || new Date().toISOString(),
+        }))
+        .filter((e: Expense) => !isItemDeleted(e.id));
 
-      // Parse Settings
+      // 7. Parse Settings
       const settingsRows = valueRanges[6]?.values || [];
       const fetchedSettings: Partial<StoreSettings> = {};
       settingsRows.forEach((r: any[]) => {

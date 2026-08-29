@@ -138,7 +138,7 @@ export interface StoreSettings {
   spreadsheetId?: string;
   spreadsheetUrl?: string;
   lastSyncTime?: string;
-  syncStatus: 'idle' | 'syncing' | 'synced' | 'error' | 'disconnected';
+  syncStatus: 'idle' | 'syncing' | 'synced' | 'error' | 'disconnected' | 'needs_auth';
   syncError?: string;
 }
 
