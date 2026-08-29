@@ -1,0 +1,8 @@
+{
+  "name": "Universal Store Manager",
+  "description": "Universal small business store management app for Bangladesh with fast sales, inventory, customer dues, and Google Sheets database.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
